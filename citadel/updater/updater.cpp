@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <getopt.h>
+#include <inttypes.h>
 #include <openssl/sha.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -30,6 +31,7 @@
 /* From Nugget OS */
 #include <application.h>
 #include <app_nugget.h>
+#include <citadel_events.h>
 #include <flash_layout.h>
 #include <signed_header.h>
 
@@ -67,6 +69,7 @@ struct options_s {
   int id;
   int repo_snapshot;
   int stats;
+  int statsd;
   int ro;
   int rw;
   int reboot;
@@ -82,7 +85,9 @@ struct options_s {
   const char *device;
   int suzyq;
   int board_id;
+  int event;
   char **board_id_args;
+  int console;
 } options;
 
 enum no_short_opts_for_these {
@@ -90,6 +95,7 @@ enum no_short_opts_for_these {
   OPT_ID,
   OPT_REPO_SNAPSHOT,
   OPT_STATS,
+  OPT_STATSD,
   OPT_RO,
   OPT_RW,
   OPT_REBOOT,
@@ -102,9 +108,10 @@ enum no_short_opts_for_these {
   OPT_SELFTEST,
   OPT_SUZYQ,
   OPT_BOARD_ID,
+  OPT_EVENT,
 };
 
-const char *short_opts = ":hvlV:fF:";
+const char *short_opts = ":hvlV:fF:c";
 const struct option long_opts[] = {
   /* name    hasarg *flag val */
   {"version",       0, NULL, 'v'},
@@ -114,6 +121,7 @@ const struct option long_opts[] = {
   {"repo_snapshot", 0, NULL, OPT_REPO_SNAPSHOT},
   {"repo-snapshot", 0, NULL, OPT_REPO_SNAPSHOT},
   {"stats",         0, NULL, OPT_STATS},
+  {"statsd",        0, NULL, OPT_STATSD},
   {"ro",            0, NULL, OPT_RO},
   {"rw",            0, NULL, OPT_RW},
   {"reboot",        0, NULL, OPT_REBOOT},
@@ -131,6 +139,7 @@ const struct option long_opts[] = {
   {"selftest",      0, NULL, OPT_SELFTEST},
   {"suzyq",         0, NULL, OPT_SUZYQ},
   {"board_id",      0, NULL, OPT_BOARD_ID},
+  {"event",         0, NULL, OPT_EVENT},
 #ifndef ANDROID
   {"device",        1, NULL, OPT_DEVICE},
 #endif
@@ -167,6 +176,8 @@ void usage(const char *progname)
     "  -l, --long_version   Display the full version info\n"
     "  --id                 Display the Citadel device ID\n"
     "  --stats              Display Low Power stats\n"
+    "  --statsd             Display Low Power stats cached by citadeld\n"
+    "\n"
     "  -V SECTION           Show Citadel headers for RO_A | RO_B | RW_A | RW_B\n"
     "  -f                   Show image file version info\n"
     "  -F SECTION           Show file headers for RO_A | RO_B | RW_A | RW_B\n"
@@ -194,6 +205,8 @@ void usage(const char *progname)
     "  --suzyq [0|1]        Set the SuzyQable detection setting\n"
     "\n"
     "  --board_id [TYPE FLAG]   Get/Set board ID values\n"
+    "\n"
+    "  --event [NUM]        Get NUM pending event records (default 1)\n"
     "\n"
 #ifndef ANDROID
     "\n"
@@ -524,7 +537,7 @@ static void show_ro_string(const char *name, const uint8_t *ptr)
   hdr = reinterpret_cast<const struct SignedHeader*>(ptr);
   printf("%s:    %d.%d.%d/%08x %s\n", name,
          hdr->epoch_, hdr->major_, hdr->minor_, be32toh(hdr->img_chk_),
-         hdr->magic == MAGIC_VALID ? "ok" : "--");
+         hdr->magic == SIGNED_HEADER_MAGIC_CITADEL ? "ok" : "--");
 }
 
 static void show_rw_string(const char *name, const uint8_t *ptr)
@@ -534,10 +547,11 @@ static void show_rw_string(const char *name, const uint8_t *ptr)
 
   if (v->cookie1 == CROS_EC_VERSION_COOKIE1 &&
       v->cookie2 == CROS_EC_VERSION_COOKIE2 &&
-      (v->hdr.magic == MAGIC_DEFAULT || v->hdr.magic == MAGIC_VALID)) {
+      (v->hdr.magic == SIGNED_HEADER_MAGIC_HAVEN ||
+       v->hdr.magic == SIGNED_HEADER_MAGIC_CITADEL)) {
     printf("%s:    %d.%d.%d/%s %s\n", name,
            v->hdr.epoch_, v->hdr.major_, v->hdr.minor_, v->version,
-           v->hdr.magic == MAGIC_VALID ? "ok" : "--");
+           v->hdr.magic == SIGNED_HEADER_MAGIC_CITADEL ? "ok" : "--");
   } else {
     printf("<invalid>\n");
   }
@@ -612,7 +626,7 @@ uint32_t do_repo_snapshot(AppClient &app)
 {
   uint32_t retval;
   std::vector<uint8_t> buffer;
-  buffer.reserve(1200);
+  buffer.reserve(2048);
 
   retval = app.Call(NUGGET_PARAM_REPO_SNAPSHOT, buffer, &buffer);
 
@@ -623,6 +637,62 @@ uint32_t do_repo_snapshot(AppClient &app)
   return retval;
 }
 
+uint32_t do_console(AppClient &app, int argc, char *argv[])
+{
+  std::vector<uint8_t> buffer;
+  uint32_t rv;
+  size_t got;
+
+  if (options.console < argc) {
+    char *s = argv[options.console];
+    char c;
+    do {
+      c = *s++;
+      buffer.push_back(c);
+    } while (c);
+  }
+
+  do {
+    buffer.reserve(4096);
+    rv = app.Call(NUGGET_PARAM_CONSOLE, buffer, &buffer);
+    got = buffer.size();
+
+    if (is_app_success(rv)){
+      buffer.push_back('\0');
+      printf("%s", buffer.data());
+    }
+
+    buffer.resize(0);
+  } while (rv == APP_SUCCESS && got > 0);
+
+  return rv;
+}
+
+static void print_stats(const struct nugget_app_low_power_stats *s)
+{
+  printf("hard_reset_count            %" PRIu64 "\n", s->hard_reset_count);
+  printf("time_since_hard_reset       %" PRIu64 "\n",
+         s->time_since_hard_reset);
+  printf("wake_count                  %" PRIu64 "\n", s->wake_count);
+  printf("time_at_last_wake           %" PRIu64 "\n", s->time_at_last_wake);
+  printf("time_spent_awake            %" PRIu64 "\n", s->time_spent_awake);
+  printf("deep_sleep_count            %" PRIu64 "\n", s->deep_sleep_count);
+  printf("time_at_last_deep_sleep     %" PRIu64 "\n",
+         s->time_at_last_deep_sleep);
+  printf("time_spent_in_deep_sleep    %" PRIu64 "\n",
+         s->time_spent_in_deep_sleep);
+  if (s->time_at_ap_reset == UINT64_MAX)
+    printf("time_at_ap_reset            0x%" PRIx64 "\n", s->time_at_ap_reset);
+  else
+    printf("time_at_ap_reset            %" PRIu64 "\n", s->time_at_ap_reset);
+  if (s->time_at_ap_bootloader_done == UINT64_MAX)
+    printf("time_at_ap_bootloader_done  0x%" PRIx64 "\n",
+           s->time_at_ap_bootloader_done);
+  else
+    printf("time_at_ap_bootloader_done  %" PRIu64 "\n",
+           s->time_at_ap_bootloader_done);
+}
+
 uint32_t do_stats(AppClient &app)
 {
   struct nugget_app_low_power_stats stats;
@@ -630,33 +700,52 @@ uint32_t do_stats(AppClient &app)
   uint32_t retval;
 
   buffer.reserve(sizeof(stats));
-
   retval = app.Call(NUGGET_PARAM_GET_LOW_POWER_STATS, buffer, &buffer);
 
   if (is_app_success(retval)) {
-    if (buffer.size() < sizeof(stats)) {
-      fprintf(stderr, "Only got %zd / %zd bytes back",
+    if (buffer.size() < sizeof(stats)) { // old firmware?
+      fprintf(stderr, "# only got %zd / %zd bytes back\n",
               buffer.size(), sizeof(stats));
-      return -1;
+      memset(&stats, 0, sizeof(stats));
     }
-
-    memcpy(&stats, buffer.data(), sizeof(stats));
-
-    printf("hard_reset_count         %" PRIu64 "\n", stats.hard_reset_count);
-    printf("time_since_hard_reset    %" PRIu64 "\n",
-           stats.time_since_hard_reset);
-    printf("wake_count               %" PRIu64 "\n", stats.wake_count);
-    printf("time_at_last_wake        %" PRIu64 "\n", stats.time_at_last_wake);
-    printf("time_spent_awake         %" PRIu64 "\n", stats.time_spent_awake);
-    printf("deep_sleep_count         %" PRIu64 "\n", stats.deep_sleep_count);
-    printf("time_at_last_deep_sleep  %" PRIu64 "\n",
-           stats.time_at_last_deep_sleep);
-    printf("time_spent_in_deep_sleep %" PRIu64 "\n",
-           stats.time_spent_in_deep_sleep);
+    memcpy(&stats, buffer.data(), std::min(sizeof(stats), buffer.size()));
+    print_stats(&stats);
   }
 
   return retval;
 }
+
+#ifdef ANDROID
+uint32_t do_statsd(CitadeldProxyClient &client)
+{
+  struct nugget_app_low_power_stats stats;
+  std::vector<uint8_t> buffer;
+
+  buffer.reserve(sizeof(stats));
+  ::android::binder::Status s = client.Citadeld().getCachedStats(&buffer);
+
+  if (s.isOk()) {
+    if (buffer.size() < sizeof(stats)) { // old citadeld?
+      fprintf(stderr, "# only got %zd / %zd bytes back\n",
+              buffer.size(), sizeof(stats));
+      memset(&stats, 0, sizeof(stats));
+    }
+    memcpy(&stats, buffer.data(), std::min(sizeof(stats), buffer.size()));
+    print_stats(&stats);
+  } else {
+    printf("ERROR: binder exception %d\n", s.exceptionCode());
+    return APP_ERROR_IO;
+  }
+
+  return 0;
+}
+#else
+uint32_t do_statsd(NuggetClient &client)
+{
+  Error("citadeld isn't attached to this interface");
+  return APP_ERROR_BOGUS_ARGS;
+}
+#endif
 
 uint32_t do_reboot(AppClient &app)
 {
@@ -785,8 +874,6 @@ static void parse_hex_value(uint32_t *val, const char *str)
 
 static void show_board_id(const struct nugget_app_board_id *id)
 {
-  uint8_t feature;
-
   printf("0x%08x 0x%08x 0x%08x # ", id->type, id->flag, id->inv);
 
   if (id->type == 0xffffffff && id->flag == 0xffffffff &&
@@ -798,18 +885,6 @@ static void show_board_id(const struct nugget_app_board_id *id)
   if (id->type ^ ~id->inv) {
     printf("corrupted\n");
     return;
-  }
-
-  feature = (id->type & 0xff000000) >> 24;
-  switch (feature) {
-    case 0x00:
-      printf("Pixel 3, ");
-      break;
-    case 0x01:
-      printf("Pixel 4, ");
-      break;
-    default:
-      printf("feature 0x%2x, ", feature);
   }
 
   printf("%s, ", id->flag & 0x80 ? "MP" : "Pre-MP");
@@ -899,6 +974,52 @@ static uint32_t do_board_id(AppClient &app, int argc, char *argv[])
   if (is_app_success(rv)) {
     memcpy(&board_id, response.data(), sizeof(board_id));
     show_board_id(&board_id);
+  }
+
+  return rv;
+}
+
+static uint32_t do_event(AppClient &app, int argc, char *argv[])
+{
+  uint32_t rv;
+  int i, num = 1;
+
+  if (options.event < argc) {
+    num = atoi(argv[options.event]);
+  }
+
+  for (i = 0; i < num; i++) {
+    struct event_record evt;
+    std::vector<uint8_t> buffer;
+    buffer.reserve(sizeof(evt));
+
+    rv = app.Call(NUGGET_PARAM_GET_EVENT_RECORD, buffer, &buffer);
+
+    if (!is_app_success(rv)) {
+      // That check also displays any errors
+      break;
+    }
+
+    if (buffer.size() == 0) {
+      printf("-- no event_records --\n");
+      continue;
+    }
+
+    if (buffer.size() != sizeof(evt)) {
+      fprintf(stderr, "Error: expected %zd bytes, got %zd instead\n",
+             sizeof(evt), buffer.size());
+      rv = 1;
+      break;
+    }
+
+    /* We got an event, let's show it */
+    memcpy(&evt, buffer.data(), sizeof(evt));
+    uint64_t secs = evt.uptime_usecs / 1000000UL;
+    uint64_t usecs = evt.uptime_usecs - (secs * 1000000UL);
+    printf("event record %" PRIu64 "/%" PRIu64 ".%06" PRIu64 ": ",
+           evt.reset_count, secs, usecs);
+    printf("%d  0x%08x 0x%08x 0x%08x\n", evt.id,
+           evt.u.raw.w[0], evt.u.raw.w[1], evt.u.raw.w[2]);
   }
 
   return rv;
@@ -1027,6 +1148,11 @@ int execute_commands(const std::vector<uint8_t> &image,
     return 2;
   }
 
+  if (options.statsd &&
+      do_statsd(client) != APP_SUCCESS) {
+    return 2;
+  }
+
   if (options.repo_snapshot &&
       do_repo_snapshot(app) != APP_SUCCESS) {
     return 2;
@@ -1073,6 +1199,16 @@ int execute_commands(const std::vector<uint8_t> &image,
 
   if (options.board_id &&
       do_board_id(app, argc, argv) != APP_SUCCESS) {
+    return 1;
+  }
+
+  if (options.console &&
+      do_console(app, argc, argv) != APP_SUCCESS) {
+    return 1;
+  }
+
+  if (options.event &&
+      do_event(app, argc, argv) != APP_SUCCESS) {
     return 1;
   }
 
@@ -1123,6 +1259,10 @@ int main(int argc, char *argv[])
       options.section = parse_section(optarg);
       got_action = 1;
       break;
+    case 'c':
+      options.console = optind;
+      got_action = 1;
+      break;
     case 'f':
       options.file_version = 1;
       need_file = 1;
@@ -1143,6 +1283,10 @@ int main(int argc, char *argv[])
       break;
     case OPT_STATS:
       options.stats = 1;
+      got_action = 1;
+      break;
+    case OPT_STATSD:
+      options.statsd = 1;
       got_action = 1;
       break;
     case OPT_RO:
@@ -1193,6 +1337,10 @@ int main(int argc, char *argv[])
     case OPT_BOARD_ID:
       options.board_id = optind;
       options.board_id_args = argv;
+      got_action = 1;
+      break;
+    case OPT_EVENT:
+      options.event = optind;
       got_action = 1;
       break;
     case OPT_SELFTEST:
