@@ -31,7 +31,7 @@ cc_binary {
     shared_libs: [
         "libcrypto",
         "libnos",
-        "libnos_citadeld_proxy",
+        //"libnos_citadeld_proxy",
         "libnos_client_citadel",
         "libutils",
     ],
